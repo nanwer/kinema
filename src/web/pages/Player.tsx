@@ -131,11 +131,12 @@ export function Player({ kind }: { kind?: RouteKind } = {}) {
       })
       .then((resp) => {
         if (latestStartTokenRef.current !== token) {
-          // This start was superseded — end the orphaned session so it
-          // doesn't sit on the server until the heartbeat watchdog reaps it.
-          void streamApi.end(resp.session_id).catch(() => {
-            // best-effort
-          });
+          // Stale token. Discard silently — DO NOT call streamApi.end here.
+          // WebTorrent dedupes by infoHash, so multiple "duplicate" start
+          // requests share an underlying torrent. Calling /end on a stale
+          // response also decrements the live session's refcount and
+          // destroys the on-disk store. The session-cleaner reaps genuinely
+          // orphaned sessions on the heartbeat-timeout schedule (2 min).
           return;
         }
         setSession(resp);
