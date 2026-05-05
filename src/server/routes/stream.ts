@@ -19,6 +19,7 @@ import { transcodeQueue } from '../services/transcode-queue.js';
 import { stallDetector } from '../services/stall-detector.js';
 import { resolveTarget } from '../services/media-resolver.js';
 import { parseRange } from '../lib/range.js';
+import { env } from '../env.js';
 import type { Pipeline, StreamStartResponse, StreamStatus } from '../../shared/types.js';
 
 type SessionRuntime = {
@@ -215,15 +216,25 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
 
     streamSessionsRepo.setFilePath(sessionId, handle.filePath);
 
-    // Fast path: for files with a browser-friendly extension, assume direct
-    // play and skip ffprobe entirely. The browser fetches /file via HTTP
-    // range requests; WebTorrent's createReadStream blocks per-range until
-    // pieces arrive. Trades a small accuracy loss (we won't catch a rare
-    // HEVC-in-MP4 release) for time-to-first-frame and resilience to slow
-    // peer-driven head downloads. If the browser can't decode the file, the
-    // user picks a different source via the Sources picker.
+    // Fast path: skip waitForHead + ffprobe based on filename signals.
+    // Trades probe accuracy for time-to-first-frame and resilience to slow
+    // peer-driven head downloads.
+    //
+    //  - .mp4/.m4v/.webm with h264/x264 → 'direct'
+    //  - .mp4 or .mkv with HEVC/x265   → 'full_transcode'
+    //  - .mkv with h264/x264           → 'remux' (container only, no encode)
+    //  - everything else                → slow path (waitForHead + probe + decide)
     const fastPathExt = path.extname(handle.fileName).toLowerCase();
-    const fastPathDirect = fastPathExt === '.mp4' || fastPathExt === '.m4v' || fastPathExt === '.webm';
+    const fnLower = handle.fileName.toLowerCase();
+    const isHevc = /\b(hevc|x265|h265)\b/.test(fnLower);
+    const isH264 = /\b(x264|h264|avc)\b/.test(fnLower);
+    const directExt = fastPathExt === '.mp4' || fastPathExt === '.m4v' || fastPathExt === '.webm';
+    const mkvExt = fastPathExt === '.mkv';
+
+    let fastPathPipeline: 'direct' | 'remux' | 'full_transcode' | null = null;
+    if (directExt && !isHevc) fastPathPipeline = 'direct';
+    else if (mkvExt && isH264 && !isHevc) fastPathPipeline = 'remux';
+    else if (isHevc) fastPathPipeline = 'full_transcode';
 
     const transcodeInput: TranscodeInput = {
       sessionId,
@@ -233,11 +244,18 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     };
 
     let decision: TranscodeDecision;
-    if (fastPathDirect) {
-      decision = { pipeline: 'direct' };
+    if (fastPathPipeline) {
+      const outputDir =
+        fastPathPipeline === 'direct'
+          ? undefined
+          : path.join(env.DATA_DIR, 'transcode', sessionId);
+      decision = {
+        pipeline: fastPathPipeline,
+        ...(outputDir ? { outputDir, playlistUrl: '/playlist.m3u8' } : {}),
+      };
       logger.info(
-        { sessionId, fileName: handle.fileName, fastPath: true },
-        'fast-path: skipping probe, assuming direct play',
+        { sessionId, fileName: handle.fileName, fastPath: true, pipeline: fastPathPipeline },
+        'fast-path decision (skipping probe)',
       );
     } else {
       // Slow path (.mkv, .avi, etc.) — wait for head bytes, run ffprobe.
