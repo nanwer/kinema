@@ -107,14 +107,19 @@ export function Player({ kind }: { kind?: RouteKind } = {}) {
   const picked = results[pickedIndex] ?? null;
 
   // Step 2: start the stream when we have a pick.
+  // Token-based "latest wins" pattern: each effect invocation gets a unique
+  // token. When the start request resolves, we only commit its result if our
+  // token is still the latest. If a newer effect run replaced it, we end the
+  // orphaned session cleanly instead of throwing the response away (which
+  // would leak a backend session AND leave the UI stuck on "starting").
+  const latestStartTokenRef = useRef<symbol | null>(null);
   useEffect(() => {
-    if (!picked) return;
-    let aborted = false;
+    if (!picked) return undefined;
+    const token = Symbol('start');
+    latestStartTokenRef.current = token;
     setSession(null);
     setStartError(null);
 
-    // Backend resolves tmdb_id (+ season/episode for shows) into the right DB
-    // row id (media_items.id or episodes.id) and writes it into watch_state.
     streamApi
       .start({
         magnet_uri: picked.magnet_uri,
@@ -125,19 +130,23 @@ export function Player({ kind }: { kind?: RouteKind } = {}) {
         prefer_direct_play: true,
       })
       .then((resp) => {
-        if (aborted) return;
+        if (latestStartTokenRef.current !== token) {
+          // This start was superseded — end the orphaned session so it
+          // doesn't sit on the server until the heartbeat watchdog reaps it.
+          void streamApi.end(resp.session_id).catch(() => {
+            // best-effort
+          });
+          return;
+        }
         setSession(resp);
         activeSessionIdRef.current = resp.session_id;
       })
       .catch((err: unknown) => {
-        if (aborted) return;
+        if (latestStartTokenRef.current !== token) return;
         const msg = err instanceof Error ? err.message : 'Failed to start stream';
         setStartError(msg);
       });
-
-    return () => {
-      aborted = true;
-    };
+    return undefined;
   }, [picked, effectiveKind, tmdbId, season, episode]);
 
   // Step 3a: read default subtitle language from app settings (long staleTime).
