@@ -215,54 +215,62 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
 
     streamSessionsRepo.setFilePath(sessionId, handle.filePath);
 
-    // Wait for the head of the file to actually exist on disk before probing.
-    // 2 MB is enough for ffprobe to read most MP4/MKV moov atoms placed at the
-    // start (YIFY/YTS releases use faststart, so moov is at byte 0). Larger
-    // values are wasteful and harder to satisfy through slow VPN peer paths.
-    // 120s timeout accommodates slow peer responsiveness.
-    try {
-      await handle.waitForHead(2 * 1024 * 1024, 120_000);
-    } catch (err) {
-      logger.error({ sessionId, err }, 'waiting for file head failed');
-      await handle.stop();
-      runtimes.delete(sessionId);
-      streamSessionsRepo.delete(sessionId);
-      return reply.status(504).send({ error: 'no_peers_for_head' });
-    }
-
-    let probeResult;
-    try {
-      probeResult = await probe(handle.filePath);
-    } catch (err) {
-      logger.error({ sessionId, err }, 'probe failed');
-      await handle.stop();
-      runtimes.delete(sessionId);
-      streamSessionsRepo.delete(sessionId);
-      return reply.status(500).send({ error: 'probe_failed' });
-    }
+    // Fast path: for files with a browser-friendly extension, assume direct
+    // play and skip ffprobe entirely. The browser fetches /file via HTTP
+    // range requests; WebTorrent's createReadStream blocks per-range until
+    // pieces arrive. Trades a small accuracy loss (we won't catch a rare
+    // HEVC-in-MP4 release) for time-to-first-frame and resilience to slow
+    // peer-driven head downloads. If the browser can't decode the file, the
+    // user picks a different source via the Sources picker.
+    const fastPathExt = path.extname(handle.fileName).toLowerCase();
+    const fastPathDirect = fastPathExt === '.mp4' || fastPathExt === '.m4v' || fastPathExt === '.webm';
 
     const transcodeInput: TranscodeInput = {
       sessionId,
       filePath: handle.filePath,
-      // For non-direct pipelines we must pipe WebTorrent's blocking read
-      // stream into ffmpeg's stdin. Reading the on-disk file directly hits
-      // the partial-file EOF and ffmpeg exits before the rest is downloaded.
-      // The stream is created lazily below only if the chosen pipeline is
-      // not 'direct' — for 'direct' the HTTP range route serves the file
-      // and no stream is consumed here.
       userAgent: String(req.headers['user-agent'] ?? ''),
       burnInOptIn: false,
     };
 
     let decision: TranscodeDecision;
-    try {
-      decision = await decide(probeResult, transcodeInput);
-    } catch (err) {
-      logger.error({ sessionId, err }, 'decide failed');
-      await handle.stop();
-      runtimes.delete(sessionId);
-      streamSessionsRepo.delete(sessionId);
-      return reply.status(500).send({ error: 'decide_failed' });
+    if (fastPathDirect) {
+      decision = { pipeline: 'direct' };
+      logger.info(
+        { sessionId, fileName: handle.fileName, fastPath: true },
+        'fast-path: skipping probe, assuming direct play',
+      );
+    } else {
+      // Slow path (.mkv, .avi, etc.) — wait for head bytes, run ffprobe.
+      try {
+        await handle.waitForHead(2 * 1024 * 1024, 120_000);
+      } catch (err) {
+        logger.error({ sessionId, err }, 'waiting for file head failed');
+        await handle.stop();
+        runtimes.delete(sessionId);
+        streamSessionsRepo.delete(sessionId);
+        return reply.status(504).send({ error: 'no_peers_for_head' });
+      }
+
+      let probeResult;
+      try {
+        probeResult = await probe(handle.filePath);
+      } catch (err) {
+        logger.error({ sessionId, err }, 'probe failed');
+        await handle.stop();
+        runtimes.delete(sessionId);
+        streamSessionsRepo.delete(sessionId);
+        return reply.status(500).send({ error: 'probe_failed' });
+      }
+
+      try {
+        decision = await decide(probeResult, transcodeInput);
+      } catch (err) {
+        logger.error({ sessionId, err }, 'decide failed');
+        await handle.stop();
+        runtimes.delete(sessionId);
+        streamSessionsRepo.delete(sessionId);
+        return reply.status(500).send({ error: 'decide_failed' });
+      }
     }
 
     streamSessionsRepo.setPipeline(sessionId, decision.pipeline);
