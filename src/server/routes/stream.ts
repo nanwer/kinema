@@ -216,10 +216,12 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     streamSessionsRepo.setFilePath(sessionId, handle.filePath);
 
     // Wait for the head of the file to actually exist on disk before probing.
-    // ffprobe needs real bytes; without this, probe runs on a path WebTorrent
-    // hasn't created yet and fails with ENOENT.
+    // 2 MB is enough for ffprobe to read most MP4/MKV moov atoms placed at the
+    // start (YIFY/YTS releases use faststart, so moov is at byte 0). Larger
+    // values are wasteful and harder to satisfy through slow VPN peer paths.
+    // 120s timeout accommodates slow peer responsiveness.
     try {
-      await handle.waitForHead(8 * 1024 * 1024, 60_000);
+      await handle.waitForHead(2 * 1024 * 1024, 120_000);
     } catch (err) {
       logger.error({ sessionId, err }, 'waiting for file head failed');
       await handle.stop();
