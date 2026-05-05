@@ -32,6 +32,24 @@ type SessionRuntime = {
 
 const runtimes = new Map<string, SessionRuntime>();
 
+// Dedup of /api/stream/start by (profile_id, magnet_uri). React effect re-runs
+// (StrictMode in dev, parent remounts in prod, double-clicks) routinely fire
+// 2-4 /start calls within a few hundred ms for the same magnet. Without dedup,
+// each call creates its own sessionId, spawns its own ffmpeg, and competes
+// with the others for head pieces of the same torrent file — none of them
+// finish, the frontend's "latest wins" discards the one usable response, and
+// the player gets stuck on "Starting stream…".
+//
+// We key by profile+magnet (not just magnet) so two profiles intentionally
+// watching the same title still get separate sessions. Once the session is
+// torn down, the entry is removed so a fresh /start can create a new session.
+const startsInflight = new Map<string, Promise<StartResolution>>();
+const sessionToStartKey = new Map<string, string>();
+
+type StartResolution =
+  | { ok: true; resp: StreamStartResponse }
+  | { ok: false; status: number; body: { error: string } };
+
 const startSchema = z
   .object({
     magnet_uri: z.string().min(1),
@@ -105,6 +123,11 @@ async function teardownSession(id: string): Promise<void> {
   }
   stallDetector.detach(id);
   streamSessionsRepo.delete(id);
+  const key = sessionToStartKey.get(id);
+  if (key) {
+    sessionToStartKey.delete(id);
+    startsInflight.delete(key);
+  }
 }
 
 function kickoffTranscode(
@@ -155,6 +178,44 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.status(400).send({ error: 'invalid_body' });
     const body = parsed.data;
 
+    // Coalesce concurrent /start for the same (profile, magnet). All callers
+    // wait on the same promise and receive the same session.
+    const dedupKey = `${profileId}|${body.magnet_uri}`;
+    const existing = startsInflight.get(dedupKey);
+    if (existing) {
+      const result = await existing;
+      if (result.ok) return result.resp;
+      return reply.status(result.status).send(result.body);
+    }
+
+    const work = (async (): Promise<StartResolution> => {
+      return runStart(req, profileId, body);
+    })();
+    startsInflight.set(dedupKey, work);
+    work
+      .then((r) => {
+        if (r.ok) {
+          sessionToStartKey.set(r.resp.session_id, dedupKey);
+        } else {
+          // Failed start: clear immediately so retries can proceed.
+          startsInflight.delete(dedupKey);
+        }
+      })
+      .catch(() => {
+        // Should never happen — runStart never rejects, only returns failures.
+        startsInflight.delete(dedupKey);
+      });
+
+    const result = await work;
+    if (result.ok) return result.resp;
+    return reply.status(result.status).send(result.body);
+  });
+
+  async function runStart(
+    req: FastifyRequest,
+    profileId: number,
+    body: z.infer<typeof startSchema>,
+  ): Promise<StartResolution> {
     // Resolve to a stable DB id. Prefer tmdb_id; fall back to client-provided
     // target_id for backward compat. tmdb_id is required for episodes — without
     // it we can't look up the episode row.
@@ -174,12 +235,12 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         targetId = resolved.targetId;
       } catch (err) {
         logger.error({ err, body }, 'failed to resolve stream target');
-        return reply.status(404).send({ error: 'target_not_found' });
+        return { ok: false, status: 404, body: { error: 'target_not_found' } };
       }
     } else if (body.target_id !== undefined) {
       targetId = body.target_id;
     } else {
-      return reply.status(400).send({ error: 'invalid_body' });
+      return { ok: false, status: 400, body: { error: 'invalid_body' } };
     }
 
     const sessionId = nanoid();
@@ -211,7 +272,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
       logger.error({ sessionId, err }, 'torrent start failed');
       runtimes.delete(sessionId);
       streamSessionsRepo.delete(sessionId);
-      return reply.status(502).send({ error: 'torrent_start_failed' });
+      return { ok: false, status: 502, body: { error: 'torrent_start_failed' } };
     }
 
     streamSessionsRepo.setFilePath(sessionId, handle.filePath);
@@ -266,7 +327,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         await handle.stop();
         runtimes.delete(sessionId);
         streamSessionsRepo.delete(sessionId);
-        return reply.status(504).send({ error: 'no_peers_for_head' });
+        return { ok: false, status: 504, body: { error: 'no_peers_for_head' } };
       }
 
       let probeResult;
@@ -277,7 +338,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         await handle.stop();
         runtimes.delete(sessionId);
         streamSessionsRepo.delete(sessionId);
-        return reply.status(500).send({ error: 'probe_failed' });
+        return { ok: false, status: 500, body: { error: 'probe_failed' } };
       }
 
       try {
@@ -287,7 +348,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         await handle.stop();
         runtimes.delete(sessionId);
         streamSessionsRepo.delete(sessionId);
-        return reply.status(500).send({ error: 'decide_failed' });
+        return { ok: false, status: 500, body: { error: 'decide_failed' } };
       }
     }
 
@@ -335,8 +396,8 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
       queued,
       queue_position: queuePosition,
     };
-    return resp;
-  });
+    return { ok: true, resp };
+  }
 
   app.get<{ Params: { id: string } }>('/api/stream/:id/file', async (req, reply) => {
     const profileId = requireProfile(req, reply);
