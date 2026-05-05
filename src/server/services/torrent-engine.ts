@@ -181,24 +181,48 @@ function waitForReady(torrent: Torrent): Promise<void> {
 }
 
 function applySequentialPriority(torrent: Torrent, file: TorrentFile): void {
+  // Strategy:
+  //  1. Deselect non-chosen files only (don't touch the chosen file's pieces).
+  //  2. Compute head piece range from the file's byte offset within the torrent.
+  //  3. Mark head pieces as critical/high-priority via torrent.select.
+  // Avoids relying on file._startPiece/_endPiece which are private and may be
+  // undefined in WebTorrent v2.x — the previous implementation that did silently
+  // resulted in NO head prioritization, so WebTorrent's default rarity-first
+  // download landed pieces in the middle of the file while the head sat empty.
   for (const f of torrent.files) {
-    f.deselect();
+    if (f !== file) f.deselect();
   }
-  // The @types/webtorrent declaration omits the priority argument that the
-  // runtime accepts. Cast through unknown to avoid disabling all type checking.
-  (file.select as unknown as (priority: number) => void)(1);
-
-  const fp = file as FileWithPieces;
-  const startPiece = fp._startPiece;
-  const endPiece = fp._endPiece;
-  if (typeof startPiece !== 'number' || typeof endPiece !== 'number') return;
-  if (torrent.pieceLength <= 0) return;
-
-  const headPieceCount = Math.ceil(HEAD_PRIORITY_BYTES / torrent.pieceLength);
-  const headEndPiece = Math.min(endPiece, startPiece + Math.max(0, headPieceCount - 1));
-  if (headEndPiece >= startPiece) {
-    torrent.select(startPiece, headEndPiece, 1);
+  if (!torrent.pieceLength || torrent.pieceLength <= 0) {
+    logger.warn(
+      { sessionId: 'pre-handle', pieceLength: torrent.pieceLength },
+      'torrent.pieceLength invalid; cannot prioritize head pieces',
+    );
+    return;
   }
+  // file.offset is the absolute byte offset of this file within the torrent's
+  // concatenated piece store.
+  const fileOffset = (file as { offset?: number }).offset ?? 0;
+  const startPiece = Math.floor(fileOffset / torrent.pieceLength);
+  const headPieceCount = Math.max(
+    1,
+    Math.ceil(HEAD_PRIORITY_BYTES / torrent.pieceLength),
+  );
+  const fileEndByte = fileOffset + file.length - 1;
+  const fileEndPiece = Math.floor(fileEndByte / torrent.pieceLength);
+  const headEndPiece = Math.min(fileEndPiece, startPiece + headPieceCount - 1);
+
+  // Highest priority on head pieces. WebTorrent will prefer these from peers.
+  torrent.select(startPiece, headEndPiece, 1);
+  logger.info(
+    {
+      fileOffset,
+      pieceLength: torrent.pieceLength,
+      startPiece,
+      headEndPiece,
+      headPieceCount: headEndPiece - startPiece + 1,
+    },
+    'head pieces prioritized',
+  );
 }
 
 function destroyTorrent(torrent: Torrent): Promise<void> {
