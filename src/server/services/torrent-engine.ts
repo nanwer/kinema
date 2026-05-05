@@ -56,6 +56,11 @@ export interface TorrentHandle {
   readonly fileName: string;
   createReadStream(opts: { start: number; end: number }): NodeJS.ReadableStream;
   stats(): { peers: number; downloadBps: number; uploadBps: number; downloaded: number };
+  // Resolves when at least `bytes` of the head of the chosen file have been
+  // downloaded to disk (so callers like ffprobe can read the file). Rejects on
+  // timeout. The act of reading drives WebTorrent to prioritize those pieces,
+  // so this also kicks the head-of-file download into gear.
+  waitForHead(bytes: number, timeoutMs: number): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -254,6 +259,39 @@ export const torrentEngine: TorrentEngine = {
           uploadBps: torrent.uploadSpeed,
           downloaded: torrent.downloaded,
         };
+      },
+      waitForHead(bytes, timeoutMs) {
+        return new Promise<void>((resolve, reject) => {
+          const targetEnd = Math.min(bytes, chosen.length) - 1;
+          if (targetEnd < 0) {
+            resolve();
+            return;
+          }
+          const stream = chosen.createReadStream({
+            start: 0,
+            end: targetEnd,
+          }) as unknown as NodeJS.ReadableStream & { destroy: () => void };
+          let received = 0;
+          const timer = setTimeout(() => {
+            stream.destroy();
+            reject(
+              new Error(
+                `timeout waiting for first ${bytes} bytes (got ${received})`,
+              ),
+            );
+          }, timeoutMs);
+          stream.on('data', (chunk: Buffer | string) => {
+            received += chunk.length;
+          });
+          stream.on('end', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+          stream.on('error', (err: unknown) => {
+            clearTimeout(timer);
+            reject(err instanceof Error ? err : new Error(String(err)));
+          });
+        });
       },
       async stop() {
         handles.delete(sessionId);
