@@ -84,6 +84,26 @@ type FileWithPieces = TorrentFile & {
 
 let clientPromise: Promise<WebTorrentClient> | null = null;
 
+// Reference count by infoHash. WebTorrent dedupes torrents by hash — multiple
+// `client.add(magnet)` calls for the same magnet return the same Torrent
+// instance. So if multiple sessions reference the same infoHash and one of
+// them stops, we MUST NOT destroy the torrent (and its on-disk store) until
+// the last referring session stops. Without this, "loser" sessions from React
+// effect re-runs would tear down the storage that the "winner" is streaming.
+const refCounts = new Map<string, number>();
+function incRef(infoHash: string): void {
+  refCounts.set(infoHash, (refCounts.get(infoHash) ?? 0) + 1);
+}
+function decRefShouldDestroy(infoHash: string): boolean {
+  const next = (refCounts.get(infoHash) ?? 1) - 1;
+  if (next <= 0) {
+    refCounts.delete(infoHash);
+    return true;
+  }
+  refCounts.set(infoHash, next);
+  return false;
+}
+
 function getClient(): Promise<WebTorrentClient> {
   if (!clientPromise) {
     clientPromise = new Promise((resolve, reject) => {
@@ -218,6 +238,7 @@ export const torrentEngine: TorrentEngine = {
       await destroyTorrent(torrent);
       throw err;
     }
+    incRef(torrent.infoHash);
 
     const chosen = pickFile(torrent.files, pickFor);
     if (!chosen) {
@@ -295,8 +316,13 @@ export const torrentEngine: TorrentEngine = {
       },
       async stop() {
         handles.delete(sessionId);
-        await destroyTorrent(torrent);
-        logger.info({ sessionId }, 'torrent session stopped');
+        const lastRef = decRefShouldDestroy(torrent.infoHash);
+        if (lastRef) {
+          await destroyTorrent(torrent);
+          logger.info({ sessionId, infoHash: torrent.infoHash }, 'torrent session stopped (last ref, store destroyed)');
+        } else {
+          logger.info({ sessionId, infoHash: torrent.infoHash }, 'torrent session stopped (refs remain)');
+        }
       },
     };
 
