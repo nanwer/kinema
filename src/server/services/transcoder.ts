@@ -10,6 +10,12 @@ export type SubtitleFormat = 'vtt' | 'ass' | 'ssa' | 'pgs';
 export type TranscodeInput = {
   sessionId: string;
   filePath: string;
+  // Optional readable stream that yields the input file's bytes from 0 to
+  // end. When provided, ffmpeg reads from `pipe:0` and the stream is piped
+  // into stdin. This is critical when the underlying file is being written
+  // concurrently (e.g. by WebTorrent) — reading the file directly hits the
+  // current EOF and ffmpeg exits prematurely.
+  inputStream?: NodeJS.ReadableStream;
   userAgent: string;
   desiredSubtitles?: { vttPath: string; format: SubtitleFormat };
   burnInOptIn?: boolean;
@@ -222,7 +228,7 @@ function buildFfmpegArgs(
   input: TranscodeInput,
   outputDir: string,
 ): string[] {
-  const inFile = input.filePath;
+  const inFile = input.inputStream ? 'pipe:0' : input.filePath;
   switch (pipeline) {
     case 'remux':
       return [
@@ -365,7 +371,24 @@ export async function start(
   );
   logger.debug({ sessionId: input.sessionId, args }, 'ffmpeg args');
 
-  const child: ChildProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const useStdin = !!input.inputStream;
+  const child: ChildProcess = spawn('ffmpeg', args, {
+    stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+  });
+
+  if (useStdin && input.inputStream && child.stdin) {
+    // Pipe WebTorrent's read stream into ffmpeg's stdin. The stream blocks on
+    // un-downloaded pieces, so ffmpeg waits naturally as the head-of-file
+    // sequential download progresses. Errors here are usually benign (e.g.
+    // ffmpeg closing stdin on its own when it's done with input).
+    input.inputStream.on('error', (err: unknown) => {
+      logger.warn({ sessionId: input.sessionId, err: String(err) }, 'transcode input stream error');
+    });
+    child.stdin.on('error', (err: unknown) => {
+      logger.debug({ sessionId: input.sessionId, err: String(err) }, 'ffmpeg stdin pipe error');
+    });
+    input.inputStream.pipe(child.stdin);
+  }
 
   child.stderr?.on('data', (b: Buffer) => {
     logger.debug({ sessionId: input.sessionId, ffmpeg: b.toString().trim() }, 'ffmpeg');

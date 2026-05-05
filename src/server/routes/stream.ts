@@ -242,6 +242,12 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     const transcodeInput: TranscodeInput = {
       sessionId,
       filePath: handle.filePath,
+      // For non-direct pipelines we must pipe WebTorrent's blocking read
+      // stream into ffmpeg's stdin. Reading the on-disk file directly hits
+      // the partial-file EOF and ffmpeg exits before the rest is downloaded.
+      // The stream is created lazily below only if the chosen pipeline is
+      // not 'direct' — for 'direct' the HTTP range route serves the file
+      // and no stream is consumed here.
       userAgent: String(req.headers['user-agent'] ?? ''),
       burnInOptIn: false,
     };
@@ -282,7 +288,11 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         queuePosition = status.queuedIds.length + 1;
         if (rt) rt.queuePosition = queuePosition;
       }
-      kickoffTranscode(sessionId, decision, transcodeInput);
+      // Open a blocking read stream over the full file for ffmpeg's stdin.
+      // WebTorrent blocks on un-downloaded pieces, so ffmpeg waits as
+      // sequential download progresses instead of hitting partial-file EOF.
+      const inputStream = handle.createReadStream({ start: 0, end: handle.fileSize - 1 });
+      kickoffTranscode(sessionId, decision, { ...transcodeInput, inputStream });
     }
 
     const url =
