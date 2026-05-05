@@ -1,0 +1,122 @@
+services:
+  # ---------------------------------------------------------------------------
+  # gluetun: VPN gateway. The `app` container shares this network namespace
+  # via `network_mode: "service:gluetun"`, so all of kinema's outbound traffic
+  # (WebTorrent peers, TMDB, OpenSubtitles, ...) exits through the VPN tunnel.
+  # If the VPN drops, gluetun's killswitch blocks all egress — no leaks.
+  #
+  # Prowlarr stays OUT of the VPN: indexer scraping is plain HTTP, some
+  # indexers block known VPN ranges, and there's no privacy benefit since
+  # we're talking to public sites about which torrents exist.
+  # ---------------------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: stream-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+    environment:
+      VPN_SERVICE_PROVIDER: surfshark
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES:-Netherlands}
+      # Allow direct (non-VPN) traffic to the LAN and Docker bridge networks
+      # so that:
+      #   1. Your laptop on 192.168.x.x can reach kinema's web UI on :3000
+      #   2. The app container can reach prowlarr at http://prowlarr:9696
+      #      via Docker's internal DNS without routing through the VPN.
+      FIREWALL_OUTBOUND_SUBNETS: 192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+      TZ: ${TZ:-UTC}
+    ports:
+      # Kinema's web UI is published HERE, not on the app container — because
+      # the app shares this network namespace. External clients on your LAN
+      # hit gluetun, which forwards to the app on the same loopback.
+      - "${HOST_APP_PORT:-3000}:3000"
+    networks:
+      - streamnet
+    healthcheck:
+      # Verifies the WireGuard tunnel is up by hitting an external endpoint
+      # through the tunnel. If the VPN drops, this fails, the app container
+      # waits, and outbound traffic is killswitched.
+      test: ["CMD", "wget", "-qO-", "https://ifconfig.me"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  app:
+    build:
+      context: https://github.com/nanwer/kinema.git#main
+      dockerfile: Dockerfile
+    image: stream-app:latest
+    container_name: stream-app
+    restart: unless-stopped
+    # CRITICAL: shares gluetun's network. App has NO own ports section —
+    # publish on gluetun above instead. Outbound traffic exits via gluetun's
+    # VPN tunnel.
+    network_mode: "service:gluetun"
+    environment:
+      NODE_ENV: production
+      PROWLARR_URL: ${PROWLARR_URL:-http://prowlarr:9696}
+      APP_PASSWORD: ${APP_PASSWORD}
+      COOKIE_SECRET: ${COOKIE_SECRET}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      PROWLARR_API_KEY: ${PROWLARR_API_KEY:-}
+      SUBTITLE_PRIMARY: ${SUBTITLE_PRIMARY:-opensubtitles}
+      OPENSUBS_API_KEY: ${OPENSUBS_API_KEY:-}
+      OPENSUBS_USERNAME: ${OPENSUBS_USERNAME:-}
+      OPENSUBS_PASSWORD: ${OPENSUBS_PASSWORD:-}
+      SUBDL_API_KEY: ${SUBDL_API_KEY:-}
+      MAX_CONCURRENT_TRANSCODES: ${MAX_CONCURRENT_TRANSCODES:-1}
+    volumes:
+      - app_data:/data
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      prowlarr:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 20s
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: stream-prowlarr
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - prowlarr_config:/config
+    ports:
+      # IMPORTANT: Bound to 127.0.0.1 only.
+      # Prowlarr ships with no auth — exposing this to the network or to a
+      # tunnel would leak your indexer search to the internet.
+      # To configure indexers, SSH to the host and visit http://127.0.0.1:9696.
+      # Do NOT change to "0.0.0.0:" or add to a tunnel without enabling
+      # Prowlarr's built-in authentication first.
+      - "127.0.0.1:${HOST_PROWLARR_PORT:-9696}:9696"
+    networks:
+      - streamnet
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9696/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  app_data:
+  prowlarr_config:
+
+networks:
+  streamnet:
+    driver: bridge
