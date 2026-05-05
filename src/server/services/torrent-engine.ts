@@ -21,21 +21,32 @@ const MIN_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 const EXCLUDE_PATTERN = /sample|trailer|featurette|extra/i;
 const HEAD_PRIORITY_BYTES = 50 * 1024 * 1024;
 
-// Public trackers used as a fallback when the magnet URI doesn't carry many
-// (e.g. some indexers ship bare-hash magnets and rely on DHT, which is slow
-// and unreliable from inside a VPN'd container). These augment whatever the
-// magnet already declares — duplicates are deduped by WebTorrent.
+// Fallback announce URLs added to every torrent. We lead with HTTP/HTTPS
+// because some commercial network paths apply protocol-aware filtering on
+// outbound UDP that drops responses to standard tracker queries. HTTP/HTTPS
+// rides on TCP, which gets through reliably. UDP entries are kept as a
+// secondary list — they cost nothing if they timeout, and work normally on
+// unfiltered networks.
 const FALLBACK_TRACKERS = [
+  // HTTPS (preferred — TCP, encrypted, hardest to filter)
+  'https://tracker.gbitt.info:443/announce',
+  'https://tracker.imgoingto.icu:443/announce',
+  'https://tracker.tamersunion.org:443/announce',
+  'https://opentracker.i2p.rocks:443/announce',
+  'https://tracker.cyberia.is:443/announce',
+  // HTTP (TCP, unencrypted)
+  'http://tracker.opentrackr.org:1337/announce',
+  'http://tracker.openbittorrent.com:80/announce',
+  'http://tracker.gbitt.info:80/announce',
+  'http://1337.abcvg.info:80/announce',
+  'http://tracker.cyberia.is:80/announce',
+  // UDP (in case the network actually allows it)
   'udp://tracker.opentrackr.org:1337/announce',
-  'udp://tracker.openbittorrent.com:6969/announce',
   'udp://exodus.desync.com:6969/announce',
   'udp://explodie.org:6969/announce',
   'udp://tracker.torrent.eu.org:451/announce',
   'udp://open.demonii.com:1337/announce',
-  'udp://open.stealth.si:80/announce',
   'udp://tracker.tiny-vps.com:6969/announce',
-  'udp://retracker.lanta-net.ru:2710/announce',
-  'http://tracker.openbittorrent.com:80/announce',
 ];
 
 export interface TorrentHandle {
@@ -72,7 +83,11 @@ function getClient(): Promise<WebTorrentClient> {
   if (!clientPromise) {
     clientPromise = new Promise((resolve, reject) => {
       try {
-        const c = new WebTorrent();
+        // DHT is UDP-only and is the first thing networks with protocol
+        // filtering drop. Disabling it keeps logs clean and forces peer
+        // discovery through the (working) HTTP/HTTPS tracker path.
+        // Re-enable for environments where outbound UDP gets responses.
+        const c = new WebTorrent({ dht: false });
         c.on('error', (err) => {
           logger.warn({ err: String(err) }, 'webtorrent client error');
         });
